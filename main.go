@@ -7,12 +7,48 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/ghodss/yaml"
 	"github.com/julienschmidt/httprouter"
-	"k8s.io/apimachinery/pkg/util/yaml"
+	yaml_util "k8s.io/apimachinery/pkg/util/yaml"
+	core "k8s.io/client-go/pkg/api/v1"
 	"k8s.io/client-go/pkg/apis/apps/v1beta1"
 )
 
-type generic map[string]interface{}
+type deploymentInitializer func(d *v1beta1.Deployment) error
+
+var initContainersInitializer = func(d *v1beta1.Deployment) error {
+	initContainer := core.Container{
+		Name:  "init",
+		Image: "init",
+	}
+
+	d.Spec.Template.Spec.InitContainers = append(d.Spec.Template.Spec.InitContainers, initContainer)
+	return nil
+}
+
+var volumeInitializer = func(d *v1beta1.Deployment) error {
+	volume := core.Volume{
+		Name: "test",
+	}
+
+	d.Spec.Template.Spec.Volumes = append(d.Spec.Template.Spec.Volumes, volume)
+	return nil
+}
+
+func removePendingInitializer(d *v1beta1.Deployment, name string) {
+	is := d.ObjectMeta.Initializers.Pending[:0]
+	for _, x := range d.ObjectMeta.Initializers.Pending {
+		if x.Name != name {
+			is = append(is, x)
+		}
+	}
+	d.ObjectMeta.Initializers.Pending = is
+}
+
+var registeredInitializers = map[string]deploymentInitializer{
+	"volume.kisc.kubernetes.io":         volumeInitializer,
+	"init-container.kisc.kubernetes.io": initContainersInitializer,
+}
 
 func Evaluate(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 	b, err := ioutil.ReadAll(r.Body)
@@ -20,7 +56,7 @@ func Evaluate(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 		http.Error(w, fmt.Sprintf("%s", err), http.StatusBadRequest)
 		return
 	}
-	j, err := yaml.ToJSON(b)
+	j, err := yaml_util.ToJSON(b)
 	var deployment v1beta1.Deployment
 	if err != nil {
 		http.Error(w, fmt.Sprintf("%s", err), http.StatusBadRequest)
@@ -33,8 +69,24 @@ func Evaluate(w http.ResponseWriter, r *http.Request, _ httprouter.Params) {
 	}
 
 	for _, pi := range deployment.ObjectMeta.Initializers.Pending {
-		fmt.Fprintf(w, "%s\n", pi.Name)
+		if f, ok := registeredInitializers[pi.Name]; ok {
+			err = f(&deployment)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("%s", err), http.StatusBadRequest)
+				return
+			} else {
+				removePendingInitializer(&deployment, pi.Name)
+			}
+		}
 	}
+
+	out, err := yaml.Marshal(deployment)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("%s", err), http.StatusInternalServerError)
+		return
+	}
+
+	fmt.Fprintf(w, "%s", out)
 }
 
 func main() {
